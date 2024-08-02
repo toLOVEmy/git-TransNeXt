@@ -15,14 +15,11 @@ from thop import profile
 # 定义优化器
 optimizers = {
     'Adam': optim.Adam
-    # 'SGD': optim.SGD,
-    # 'RMSprop': optim.RMSprop,
 }
 
 # 定义损失函数
 loss_functions = {
     'CrossEntropyLoss': nn.CrossEntropyLoss()
-    # 'MSELoss': nn.MSELoss(),
 }
 
 # 用于设置数据加载器的随机种子
@@ -79,7 +76,7 @@ def main():
 
     batch_size = 16
     lr = 0.0001
-    note = 'TransNeXt-micro-warmup25'
+    note = 'TransNeXt-micro'
     nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8])
     print('Using {} dataloader workers every process'.format(nw))
 
@@ -110,130 +107,141 @@ def main():
 
     results = []
 
-    # 遍历所有优化器和损失函数的组合
+    warmup_epochs_list = [1, 2]  # warmup_epochs 搜索列表
+    t_max_list = [5, 10, 15, 20, 25]       # T_max 搜索列表
+    accumulation_steps_list = [1, 2]  # 梯度累积步数的搜索列表
+
+    # 遍历所有优化器和损失函数的组合，以及 warmup_epochs、T_max 和 accumulation_steps 的不同组合
     for optim_name, optim_func in optimizers.items():
         for loss_name, loss_function in loss_functions.items():
-            print(f"Training with optimizer: {optim_name}, loss function: {loss_name}")
+            for warmup_epochs in warmup_epochs_list:
+                for t_max in t_max_list:
+                    for accumulation_steps in accumulation_steps_list:
+                        print(f"Training with optimizer: {optim_name}, loss function: {loss_name}, warmup_epochs: {warmup_epochs}, T_max: {t_max}, accumulation_steps: {accumulation_steps}")
 
-            net = load_model()
-            net.to(device)
+                        net = load_model()
+                        net.to(device)
 
-            optimizer = optim_func(net.parameters(), lr=lr)
+                        optimizer = optim_func(net.parameters(), lr=lr)
 
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=25, eta_min=1e-7)
+                        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max, eta_min=1e-7)
 
-            # 定义warmup调度器
-            warmup_epochs = 3
-            warmup_scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: warmup_epochs)
+                        # 定义warmup调度器
+                        warmup_scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: warmup_epochs)
 
-            accumulation_steps = 1  # 进行几次梯度累积后再更新权重
-            if not os.path.exists('./weights'):
-                os.makedirs('./weights')
+                        if not os.path.exists('./weights'):
+                            os.makedirs('./weights')
 
-            best_acc = 0.0
-            best_loss = 3.0
+                        best_acc = 0.0
+                        best_loss = 3.0
 
-            total_filename = "{}-lr{}-bs{}-{}-{}-{}".format(epochs, lr, batch_size, note, optim_name, loss_name)
-            log_dir = "./runs/{}".format(total_filename)  # 自定义日志目录名称
-            tb_writer = SummaryWriter(log_dir=log_dir)
-            dummy_input = torch.randn(batch_size, 3, 224, 224).to(device)  # 这里用批量大小调整
-            tb_writer.add_graph(net, dummy_input)
+                        total_filename = "{}-lr{}-bs{}-{}-{}-{}-warmup{}-tmax{}-accumulation{}".format(epochs, lr, batch_size, note, optim_name, loss_name, warmup_epochs, t_max, accumulation_steps)
+                        log_dir = "./runs/{}".format(total_filename)  # 自定义日志目录名称
+                        tb_writer = SummaryWriter(log_dir=log_dir)
+                        dummy_input = torch.randn(batch_size, 3, 224, 224).to(device)  # 这里用批量大小调整
+                        tb_writer.add_graph(net, dummy_input)
 
-            train_start_time = time.perf_counter()
+                        train_start_time = time.perf_counter()
 
-            for epoch in range(epochs):
-                net.train()
-                running_loss = 0.0
-                train_bar = tqdm(train_loader, file=sys.stdout)
-                correct_train = 0
-                optimizer.zero_grad()  # 在每个epoch开始前清空梯度
+                        for epoch in range(epochs):
+                            net.train()
+                            running_loss = 0.0
+                            train_bar = tqdm(train_loader, file=sys.stdout)
+                            correct_train = 0
+                            optimizer.zero_grad()  # 在每个epoch开始前清空梯度
 
-                for step, data in enumerate(train_bar):
-                    images, labels = data
-                    original_labels = labels.clone()  # 保留原始标签
-                    images, labels = images.to(device), labels.to(device)
-                    if loss_name == 'MSELoss':
-                        labels = F.one_hot(labels, num_classes=5).float()
-                    logits = net(images)
-                    loss = loss_function(logits, labels)
-                    loss.backward()
+                            for step, data in enumerate(train_bar):
+                                images, labels = data
+                                original_labels = labels.clone()  # 保留原始标签
+                                images, labels = images.to(device), labels.to(device)
+                                if loss_name == 'MSELoss':
+                                    labels = F.one_hot(labels, num_classes=5).float()
+                                logits = net(images)
+                                loss = loss_function(logits, labels)
+                                loss.backward()
 
-                    if (step + 1) % accumulation_steps == 0:
-                        optimizer.step()
-                        optimizer.zero_grad()
+                                if (step + 1) % accumulation_steps == 0:
+                                    optimizer.step()
+                                    optimizer.zero_grad()
 
-                    running_loss += loss.item()
-                    predict_y = torch.max(logits, dim=1)[1]
-                    correct_train += torch.eq(predict_y, labels).sum().item()  # 使用labels而不是original_labels
-                    train_bar.desc = "train epoch[{}/{}] loss:{:.3f}".format(epoch + 1, epochs, loss)
+                                running_loss += loss.item()
+                                predict_y = torch.max(logits, dim=1)[1]
+                                correct_train += torch.eq(predict_y, labels).sum().item()  # 使用labels而不是original_labels
+                                train_bar.desc = "train epoch[{}/{}] loss:{:.3f}".format(epoch + 1, epochs, loss)
 
-                if (step + 1) % accumulation_steps != 0:
-                    optimizer.step()
-                    optimizer.zero_grad()
+                            if (step + 1) % accumulation_steps != 0:
+                                optimizer.step()
+                                optimizer.zero_grad()
 
-                train_acc = correct_train / train_num
+                            train_acc = correct_train / train_num
 
-                net.eval()
-                acc = 0.0
-                running_val_loss = 0.0
-                with torch.no_grad():
-                    val_bar = tqdm(validate_loader, file=sys.stdout)
-                    for val_data in val_bar:
-                        val_images, val_labels = val_data
-                        original_val_labels = val_labels.clone()  # 保留原始标签
-                        val_images, val_labels = val_images.to(device), val_labels.to(device)
-                        if loss_name == 'MSELoss':
-                            val_labels = F.one_hot(val_labels, num_classes=5).float()
-                        outputs = net(val_images)
-                        loss = loss_function(outputs, val_labels)
-                        running_val_loss += loss.item()
-                        predict_y = torch.max(outputs, dim=1)[1]
-                        acc += torch.eq(predict_y, val_labels).sum().item()  # 使用val_labels而不是original_val_labels
-                        val_bar.desc = "valid epoch[{}/{}]".format(epoch + 1, epochs)
+                            net.eval()
+                            acc = 0.0
+                            running_val_loss = 0.0
+                            with torch.no_grad():
+                                val_bar = tqdm(validate_loader, file=sys.stdout)
+                                for val_data in val_bar:
+                                    val_images, val_labels = val_data
+                                    original_val_labels = val_labels.clone()  # 保留原始标签
+                                    val_images, val_labels = val_images.to(device), val_labels.to(device)
+                                    if loss_name == 'MSELoss':
+                                        val_labels = F.one_hot(val_labels, num_classes=5).float()
+                                    outputs = net(val_images)
+                                    loss = loss_function(outputs, val_labels)
+                                    running_val_loss += loss.item()
+                                    predict_y = torch.max(outputs, dim=1)[1]
+                                    acc += torch.eq(predict_y, val_labels).sum().item()  # 使用val_labels而不是original_val_labels
+                                    val_bar.desc = "valid epoch[{}/{}]".format(epoch + 1, epochs)
 
-                val_acc = acc / val_num
-                running_loss /= len(train_loader)
-                running_val_loss /= len(validate_loader)
+                            val_acc = acc / val_num
+                            running_loss /= len(train_loader)
+                            running_val_loss /= len(validate_loader)
 
-                tb_writer.add_scalar('train_loss', running_loss, epoch)
-                tb_writer.add_scalar('train_acc', train_acc, epoch)
-                tb_writer.add_scalar('val_loss', running_val_loss, epoch)
-                tb_writer.add_scalar('val_acc', val_acc, epoch)
-                tb_writer.add_scalar('learning_rate', optimizer.param_groups[0]["lr"], epoch)
+                            tb_writer.add_scalar('train_loss', running_loss, epoch)
+                            tb_writer.add_scalar('train_acc', train_acc, epoch)
+                            tb_writer.add_scalar('val_loss', running_val_loss, epoch)
+                            tb_writer.add_scalar('val_acc', val_acc, epoch)
+                            tb_writer.add_scalar('learning_rate', optimizer.param_groups[0]["lr"], epoch)
 
-                print('[epoch %d] train_loss: %.3f  val_loss: %.3f  train_accuracy: %.3f  val_accuracy: %.3f' %
-                      (epoch + 1, running_loss, running_val_loss, train_acc, val_acc))
+                            print('[epoch %d] train_loss: %.3f  val_loss: %.3f  train_accuracy: %.3f  val_accuracy: %.3f' %
+                                  (epoch + 1, running_loss, running_val_loss, train_acc, val_acc))
 
-                if val_acc > best_acc:
-                    best_acc = val_acc
-                    model_filename = "./weights/model-{}-{}-{}-{}-{}-{}-acc.pth".format(epochs, lr, batch_size, note, optim_name, loss_name)
-                    torch.save(net.state_dict(), model_filename)
-                    print(f"Epoch {epoch}: 保存新最佳模型 {model_filename}，验证准确率: {val_acc:.4f}")
+                            if val_acc > best_acc:
+                                best_acc = val_acc
+                                model_filename = "./weights/model-{}-{}-{}-{}-{}-{}-warmup{}-tmax{}-accumulation{}-acc.pth".format(epochs, lr, batch_size, note, optim_name, loss_name, warmup_epochs, t_max, accumulation_steps)
+                                torch.save(net.state_dict(), model_filename)
+                                print(f"Epoch {epoch}: 保存新最佳模型 {model_filename}，验证准确率: {val_acc:.4f}")
 
-                if running_val_loss < best_loss:
-                    best_loss = running_val_loss
-                    model_filename = "./weights/model-{}-{}-{}-{}-{}-{}-loss.pth".format(epochs, lr, batch_size, note, optim_name, loss_name)
-                    torch.save(net.state_dict(), model_filename)
-                    print(f"Epoch {epoch}: 保存新最佳模型 {model_filename}，验证损失: {running_val_loss:.4f}")
+                            if running_val_loss < best_loss:
+                                best_loss = running_val_loss
+                                model_filename = "./weights/model-{}-{}-{}-{}-{}-{}-warmup{}-tmax{}-accumulation{}-loss.pth".format(epochs, lr, batch_size, note, optim_name, loss_name, warmup_epochs, t_max, accumulation_steps)
+                                torch.save(net.state_dict(), model_filename)
+                                print(f"Epoch {epoch}: 保存新最佳模型 {model_filename}，验证损失: {running_val_loss:.4f}")
 
-                scheduler.step()
+                            if epoch < warmup_epochs:
+                                warmup_scheduler.step()
+                            else:
+                                scheduler.step()
 
-            train_end_time = time.perf_counter()
-            total_train_time = train_end_time - train_start_time
-            tb_writer.add_text('Total Training Time', f"Training time: {total_train_time:.2f} seconds")
+                        train_end_time = time.perf_counter()
+                        total_train_time = train_end_time - train_start_time
+                        tb_writer.add_text('Total Training Time', f"Training time: {total_train_time:.2f} seconds")
 
-            results.append({
-                'optimizer': optim_name,
-                'loss_function': loss_name,
-                'best_val_acc': best_acc,
-                'best_val_loss': best_loss,
-                'total_train_time': total_train_time,
-            })
+                        results.append({
+                            'optimizer': optim_name,
+                            'loss_function': loss_name,
+                            'warmup_epochs': warmup_epochs,
+                            'T_max': t_max,
+                            'accumulation_steps': accumulation_steps,
+                            'best_val_acc': best_acc,
+                            'best_val_loss': best_loss,
+                            'total_train_time': total_train_time,
+                        })
 
-            with open('results.json', 'a') as f:
-                json.dump(results, f, indent=4)
+                        with open('results1.json', 'a') as f:
+                            json.dump(results, f, indent=4)
 
-            tb_writer.close()
+                        tb_writer.close()
 
 if __name__ == '__main__':
     main()
